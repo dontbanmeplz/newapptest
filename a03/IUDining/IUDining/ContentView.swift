@@ -31,6 +31,7 @@ struct ContentView: View {
                 }
                 .tag(2)
         }
+        .toolbarBackground(.visible, for: .tabBar)
         .task {
             LocationService.shared.requestPermission()
             await viewModel.loadLocations()

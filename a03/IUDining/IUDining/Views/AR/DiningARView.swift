@@ -22,15 +22,15 @@ struct DiningARView: View {
                 if ARWorldTrackingConfiguration.isSupported {
                     ARViewContainer(
                         locations: locations,
-                        userLocation: locationService.userLocation,
-                        heading: locationService.heading
+                        userLocation: locationService.userLocation
                     )
-                    .ignoresSafeArea()
+                    .ignoresSafeArea(.container, edges: .top)
 
                     // Overlay with location cards
                     VStack {
                         Spacer()
                         locationCarousel
+                            .padding(.bottom, 8)
                     }
                 } else {
                     ContentUnavailableView(
@@ -42,6 +42,7 @@ struct DiningARView: View {
             }
             .navigationTitle("AR View")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.visible, for: .tabBar)
             .onAppear {
                 locationService.startHeading()
             }
@@ -78,7 +79,6 @@ struct DiningARView: View {
                 }
             }
             .padding(.horizontal)
-            .padding(.bottom, 20)
         }
     }
 
@@ -97,66 +97,84 @@ struct DiningARView: View {
 struct ARViewContainer: UIViewRepresentable {
     let locations: [DiningLocation]
     let userLocation: CLLocation?
-    let heading: CLHeading?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
 
     func makeUIView(context: Context) -> ARView {
         let arView = ARView(frame: .zero)
 
         let config = ARWorldTrackingConfiguration()
-        config.worldAlignment = .gravityAndHeading // Align -Z to compass north
+        // gravityAndHeading aligns ARKit's -Z axis to compass north automatically
+        config.worldAlignment = .gravityAndHeading
         arView.session.run(config)
 
+        context.coordinator.arView = arView
         return arView
     }
 
     func updateUIView(_ arView: ARView, context: Context) {
+        guard let userLoc = userLocation else { return }
+
+        // Only rebuild markers if user moved significantly (>15m) or first time
+        if let lastLoc = context.coordinator.lastPlacedLocation {
+            let moved = userLoc.distance(from: lastLoc)
+            if moved < 15 { return }
+        }
+
+        context.coordinator.lastPlacedLocation = userLoc
+        placeMarkers(in: arView, userLocation: userLoc)
+    }
+
+    private func placeMarkers(in arView: ARView, userLocation: CLLocation) {
         // Remove old markers
         arView.scene.anchors.removeAll()
 
-        guard let userLoc = userLocation, let heading = heading else { return }
-
         for location in locations where location.hasLocation {
-            let distance = Float(userLoc.distance(from: location.clLocation))
+            let realDistance = Float(userLocation.distance(from: location.clLocation))
 
             // Skip locations further than 5km
-            guard distance < 5000 else { continue }
+            guard realDistance < 5000 else { continue }
 
+            // Calculate bearing from user to target (radians, 0 = north, clockwise)
             let bearing = bearingBetween(
-                userLat: userLoc.coordinate.latitude,
-                userLon: userLoc.coordinate.longitude,
+                userLat: userLocation.coordinate.latitude,
+                userLon: userLocation.coordinate.longitude,
                 targetLat: location.coordinate.latitude,
                 targetLon: location.coordinate.longitude
             )
 
-            // Adjust bearing for device heading
-            let headingRad = Float(heading.trueHeading * .pi / 180)
-            let adjustedBearing = bearing - headingRad
+            // With gravityAndHeading, ARKit -Z = north, +X = east
+            // No heading adjustment needed -- ARKit handles compass alignment
+            // Clamp AR distance so markers are visible (max 80m in AR space)
+            let arDistance = min(realDistance, 80)
 
-            // Clamp distance for AR visibility (max 100m in AR space)
-            let arDistance = min(distance, 100)
+            // Convert bearing + distance to cartesian
+            // bearing=0 is north (-Z), bearing=pi/2 is east (+X)
+            let x = arDistance * sin(bearing)
+            let z = -arDistance * cos(bearing)
+            let y: Float = 2.0 // Place at eye level / slightly above
 
-            // Convert polar to cartesian (ARKit: -Z is forward/north)
-            let x = arDistance * sin(adjustedBearing)
-            let z = -arDistance * cos(adjustedBearing)
-            let y: Float = 0 // Eye level offset
-
-            // Create marker entity
             let anchor = AnchorEntity(world: SIMD3<Float>(x, y, z))
 
-            // Sphere marker
+            // Scale sphere so it's always visible regardless of distance
+            let sphereRadius = max(0.5, arDistance * 0.025)
             let isOpen = location.isOpen()
             let color: UIColor = isOpen ? .systemGreen : .systemRed
+
             let sphere = ModelEntity(
-                mesh: .generateSphere(radius: 0.5),
-                materials: [SimpleMaterial(color: color, isMetallic: false)]
+                mesh: .generateSphere(radius: sphereRadius),
+                materials: [SimpleMaterial(color: color.withAlphaComponent(0.85), isMetallic: false)]
             )
             anchor.addChild(sphere)
 
-            // Text label above sphere
+            // Name label above sphere
+            let fontSize: CGFloat = max(0.12, CGFloat(arDistance) * 0.003)
             let textMesh = MeshResource.generateText(
                 location.name,
                 extrusionDepth: 0.01,
-                font: .systemFont(ofSize: 0.15),
+                font: .boldSystemFont(ofSize: fontSize),
                 containerFrame: .zero,
                 alignment: .center,
                 lineBreakMode: .byTruncatingTail
@@ -165,21 +183,27 @@ struct ARViewContainer: UIViewRepresentable {
                 mesh: textMesh,
                 materials: [SimpleMaterial(color: .white, isMetallic: false)]
             )
-            textEntity.position = SIMD3<Float>(0, 0.8, 0)
-
-            // Center the text
+            // Position above sphere
+            textEntity.position = SIMD3<Float>(0, sphereRadius + 0.3, 0)
+            // Center horizontally
             let textBounds = textEntity.visualBounds(relativeTo: nil)
-            let textWidth = textBounds.extents.x
-            textEntity.position.x = -textWidth / 2
+            textEntity.position.x = -textBounds.extents.x / 2
 
             anchor.addChild(textEntity)
 
-            // Distance label
-            let distStr = String(format: "%.0fm", distance)
+            // Distance label below name
+            let distStr: String
+            if realDistance < 1000 {
+                distStr = String(format: "%.0fm", realDistance)
+            } else {
+                distStr = String(format: "%.1f mi", realDistance / 1609.34)
+            }
+
+            let distFontSize: CGFloat = max(0.08, CGFloat(arDistance) * 0.002)
             let distMesh = MeshResource.generateText(
                 distStr,
-                extrusionDepth: 0.01,
-                font: .systemFont(ofSize: 0.1),
+                extrusionDepth: 0.005,
+                font: .systemFont(ofSize: distFontSize),
                 containerFrame: .zero,
                 alignment: .center,
                 lineBreakMode: .byTruncatingTail
@@ -188,7 +212,7 @@ struct ARViewContainer: UIViewRepresentable {
                 mesh: distMesh,
                 materials: [SimpleMaterial(color: .lightGray, isMetallic: false)]
             )
-            distEntity.position = SIMD3<Float>(0, 0.6, 0)
+            distEntity.position = SIMD3<Float>(0, sphereRadius + 0.1, 0)
             let distBounds = distEntity.visualBounds(relativeTo: nil)
             distEntity.position.x = -distBounds.extents.x / 2
 
@@ -198,7 +222,7 @@ struct ARViewContainer: UIViewRepresentable {
         }
     }
 
-    /// Calculate bearing between two GPS coordinates (returns radians)
+    /// Calculate bearing from point A to point B (returns radians, 0 = north, clockwise)
     private func bearingBetween(userLat: Double, userLon: Double, targetLat: Double, targetLon: Double) -> Float {
         let lat1 = userLat * .pi / 180
         let lat2 = targetLat * .pi / 180
@@ -208,5 +232,12 @@ struct ARViewContainer: UIViewRepresentable {
         let x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon)
 
         return Float(atan2(y, x))
+    }
+
+    // MARK: - Coordinator
+
+    class Coordinator {
+        var arView: ARView?
+        var lastPlacedLocation: CLLocation?
     }
 }
