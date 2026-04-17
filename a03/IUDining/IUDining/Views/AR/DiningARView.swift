@@ -22,7 +22,8 @@ struct DiningARView: View {
                 if ARWorldTrackingConfiguration.isSupported {
                     ARViewContainer(
                         locations: locations,
-                        userLocation: locationService.userLocation
+                        userLocation: locationService.userLocation,
+                        currentHeading: locationService.heading
                     )
                     .ignoresSafeArea(.container, edges: .top)
 
@@ -97,6 +98,7 @@ struct DiningARView: View {
 struct ARViewContainer: UIViewRepresentable {
     let locations: [DiningLocation]
     let userLocation: CLLocation?
+    let currentHeading: CLHeading?
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -106,16 +108,31 @@ struct ARViewContainer: UIViewRepresentable {
         let arView = ARView(frame: .zero)
 
         let config = ARWorldTrackingConfiguration()
-        // gravityAndHeading aligns ARKit's -Z axis to compass north automatically
-        config.worldAlignment = .gravityAndHeading
+        // Use .gravity instead of .gravityAndHeading
+        // .gravity is reliable (accelerometer only): -Z = phone's initial facing direction
+        // We manually offset by the device heading captured at session start
+        config.worldAlignment = .gravity
         arView.session.run(config)
+
+        // Capture the device heading at the moment the AR session starts
+        // This tells us which compass direction -Z corresponds to
+        if let heading = currentHeading, heading.trueHeading >= 0 {
+            context.coordinator.initialHeading = Float(heading.trueHeading)
+        }
 
         context.coordinator.arView = arView
         return arView
     }
 
     func updateUIView(_ arView: ARView, context: Context) {
-        guard let userLoc = userLocation else { return }
+        // If we didn't get a heading at session start, capture it now
+        if context.coordinator.initialHeading == nil,
+           let heading = currentHeading, heading.trueHeading >= 0 {
+            context.coordinator.initialHeading = Float(heading.trueHeading)
+        }
+
+        guard let userLoc = userLocation,
+              context.coordinator.initialHeading != nil else { return }
 
         // Only rebuild markers if user moved significantly (>15m) or first time
         if let lastLoc = context.coordinator.lastPlacedLocation {
@@ -124,12 +141,16 @@ struct ARViewContainer: UIViewRepresentable {
         }
 
         context.coordinator.lastPlacedLocation = userLoc
-        placeMarkers(in: arView, userLocation: userLoc)
+        placeMarkers(in: arView, userLocation: userLoc, coordinator: context.coordinator)
     }
 
-    private func placeMarkers(in arView: ARView, userLocation: CLLocation) {
+    private func placeMarkers(in arView: ARView, userLocation: CLLocation, coordinator: Coordinator) {
         // Remove old markers
         arView.scene.anchors.removeAll()
+
+        // initialHeading is the compass direction (degrees) that -Z pointed at session start
+        guard let initialHeadingDeg = coordinator.initialHeading else { return }
+        let initialHeadingRad = initialHeadingDeg * .pi / 180
 
         for location in locations where location.hasLocation {
             let realDistance = Float(userLocation.distance(from: location.clLocation))
@@ -137,36 +158,44 @@ struct ARViewContainer: UIViewRepresentable {
             // Skip locations further than 5km
             guard realDistance < 5000 else { continue }
 
-            // Calculate bearing from user to target (radians, 0 = north, clockwise)
-            let bearing = bearingBetween(
+            // GPS bearing from user to target (radians, 0 = north, clockwise)
+            let gpsBearing = bearingBetween(
                 userLat: userLocation.coordinate.latitude,
                 userLon: userLocation.coordinate.longitude,
                 targetLat: location.coordinate.latitude,
                 targetLon: location.coordinate.longitude
             )
 
-            // With gravityAndHeading, ARKit -Z = north, +X = east
-            // Place all markers close (5-8m) so they're large and readable on screen
-            // Spread them out by distance tier so they don't overlap
-            let arDistance: Float = 5.0 + min(realDistance / 1000.0, 1.0) * 3.0 // 5m to 8m
+            // Convert GPS bearing to AR-space angle:
+            // With .gravity alignment, -Z = the direction the phone faced at session start
+            // That direction had compass heading = initialHeadingRad
+            // So we subtract initialHeading to get the angle relative to -Z
+            let arBearing = gpsBearing - initialHeadingRad
 
-            // Convert bearing + distance to cartesian
-            let x = arDistance * sin(bearing)
-            let z = -arDistance * cos(bearing)
-            let y: Float = 1.0 // Slightly above eye level
+            // Place markers close (5-8m) so they're large and readable
+            let arDistance: Float = 5.0 + min(realDistance / 1000.0, 1.0) * 3.0
+
+            // Convert polar to cartesian (bearing=0 maps to -Z, pi/2 maps to +X)
+            let x = arDistance * sin(arBearing)
+            let z = -arDistance * cos(arBearing)
+            let y: Float = 1.0
 
             let anchor = AnchorEntity(world: SIMD3<Float>(x, y, z))
 
-            // -- Background panel for readability --
+            // Rotate the anchor so its local +Z faces back toward the camera (origin)
+            // This makes the billboard always face the user
+            let faceUserAngle = atan2(-x, -z)
+            anchor.orientation = simd_quatf(angle: faceUserAngle, axis: SIMD3<Float>(0, 1, 0))
+
+            // -- Build the billboard card --
             let isOpen = location.isOpen()
             let panelColor: UIColor = isOpen
                 ? UIColor(red: 0.1, green: 0.5, blue: 0.1, alpha: 0.88)
                 : UIColor(red: 0.6, green: 0.1, blue: 0.1, alpha: 0.88)
 
-            // Build name text first to measure it
-            let nameText = location.name
+            // Name text
             let nameMesh = MeshResource.generateText(
-                nameText,
+                location.name,
                 extrusionDepth: 0.005,
                 font: .boldSystemFont(ofSize: 0.22),
                 containerFrame: .zero,
@@ -216,7 +245,7 @@ struct ARViewContainer: UIViewRepresentable {
                 materials: [SimpleMaterial(color: statusColor, isMetallic: false)]
             )
 
-            // Measure text widths to size the panel
+            // Measure text to size the panel
             let nameBounds = nameEntity.visualBounds(relativeTo: nil)
             let distBounds = distEntity.visualBounds(relativeTo: nil)
             let statusBounds = statusEntity.visualBounds(relativeTo: nil)
@@ -234,10 +263,9 @@ struct ARViewContainer: UIViewRepresentable {
             )
             anchor.addChild(panelEntity)
 
-            // Position text on top of panel (slightly in front)
+            // Position text in front of panel (local +Z is now facing the user)
             let frontZ: Float = panelDepth / 2 + 0.005
 
-            // Name at top
             nameEntity.position = SIMD3<Float>(
                 -nameBounds.extents.x / 2,
                 0.12,
@@ -245,7 +273,6 @@ struct ARViewContainer: UIViewRepresentable {
             )
             anchor.addChild(nameEntity)
 
-            // Distance in middle
             distEntity.position = SIMD3<Float>(
                 -distBounds.extents.x / 2,
                 -0.05,
@@ -253,7 +280,6 @@ struct ARViewContainer: UIViewRepresentable {
             )
             anchor.addChild(distEntity)
 
-            // Status at bottom
             statusEntity.position = SIMD3<Float>(
                 -statusBounds.extents.x / 2,
                 -0.22,
@@ -261,10 +287,9 @@ struct ARViewContainer: UIViewRepresentable {
             )
             anchor.addChild(statusEntity)
 
-            // Small colored dot indicator at top-left of panel
-            let dotSize: Float = 0.06
+            // Status dot at top-left
             let dot = ModelEntity(
-                mesh: .generateSphere(radius: dotSize),
+                mesh: .generateSphere(radius: 0.06),
                 materials: [SimpleMaterial(color: isOpen ? .systemGreen : .systemRed, isMetallic: false)]
             )
             dot.position = SIMD3<Float>(-panelWidth / 2 + 0.1, 0.22, frontZ)
@@ -291,5 +316,6 @@ struct ARViewContainer: UIViewRepresentable {
     class Coordinator {
         var arView: ARView?
         var lastPlacedLocation: CLLocation?
+        var initialHeading: Float? // Compass heading (degrees) at AR session start
     }
 }
