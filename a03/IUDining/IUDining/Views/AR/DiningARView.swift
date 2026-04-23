@@ -9,7 +9,8 @@ import SwiftUI
 import ARKit
 import RealityKit
 import CoreLocation
-import Combine
+
+// MARK: - DiningARView (SwiftUI wrapper)
 
 struct DiningARView: View {
     let locations: [DiningLocation]
@@ -28,7 +29,6 @@ struct DiningARView: View {
                     )
                     .ignoresSafeArea(.container, edges: .top)
 
-                    // Overlay with location cards
                     VStack {
                         Spacer()
                         locationCarousel
@@ -94,7 +94,7 @@ struct DiningARView: View {
     }
 }
 
-// MARK: - AR View Container (UIViewRepresentable)
+// MARK: - ARViewContainer (UIViewRepresentable)
 
 struct ARViewContainer: UIViewRepresentable {
     let locations: [DiningLocation]
@@ -105,47 +105,35 @@ struct ARViewContainer: UIViewRepresentable {
         Coordinator()
     }
 
+    // MARK: makeUIView
+
     func makeUIView(context: Context) -> ARView {
         let arView = ARView(frame: .zero)
 
-        // Use AROrientationTrackingConfiguration (3DOF: rotation only)
-        // Camera stays at the origin — billboards naturally stay around the user
-        // We only need rotation tracking to show the correct direction
+        // 3DOF orientation-only tracking: the camera stays at the origin,
+        // billboards are placed around it based on GPS bearing + distance.
         let config = AROrientationTrackingConfiguration()
         config.worldAlignment = .gravity
         arView.session.run(config)
 
-        // Capture the device heading at the moment the AR session starts
-        // This tells us which compass direction -Z corresponds to
+        // Capture the compass heading at session start so we know
+        // which real-world direction the AR -Z axis corresponds to.
         if let heading = currentHeading, heading.trueHeading >= 0 {
             context.coordinator.initialHeading = Float(heading.trueHeading)
         }
 
         context.coordinator.arView = arView
 
-        // Subscribe to per-frame scene updates to keep billboards facing the camera
-        context.coordinator.sceneSubscription = arView.scene.subscribe(
-            to: SceneEvents.Update.self
-        ) { [weak arView] _ in
-            guard let arView = arView else { return }
-            let cameraTransform = arView.cameraTransform
-            let cameraPos = cameraTransform.translation
-
-            for entry in context.coordinator.billboardEntries {
-                let anchor = entry.anchor
-                let pos = anchor.position
-                let dx = cameraPos.x - pos.x
-                let dz = cameraPos.z - pos.z
-                let faceAngle = atan2(dx, dz)
-                anchor.orientation = simd_quatf(angle: faceAngle, axis: SIMD3<Float>(0, 1, 0))
-            }
-        }
+        // No per-frame subscription needed: BillboardComponent handles
+        // face-camera rotation automatically.
 
         return arView
     }
 
+    // MARK: updateUIView
+
     func updateUIView(_ arView: ARView, context: Context) {
-        // If we didn't get a heading at session start, capture it now
+        // Capture heading if we missed it at session start
         if context.coordinator.initialHeading == nil,
            let heading = currentHeading, heading.trueHeading >= 0 {
             context.coordinator.initialHeading = Float(heading.trueHeading)
@@ -154,37 +142,35 @@ struct ARViewContainer: UIViewRepresentable {
         guard let userLoc = userLocation,
               context.coordinator.initialHeading != nil else { return }
 
-        // Rebuild markers when GPS updates (LocationService.distanceFilter handles throttling)
-        // Skip if the location hasn't meaningfully changed
+        // Only rebuild when the user has moved significantly (>5 m)
         if let lastLoc = context.coordinator.lastPlacedLocation {
-            let moved = userLoc.distance(from: lastLoc)
-            if moved < 5 { return }
+            if userLoc.distance(from: lastLoc) < 5 { return }
         }
 
         context.coordinator.lastPlacedLocation = userLoc
-        context.coordinator.currentUserLocation = userLoc
         placeMarkers(in: arView, userLocation: userLoc, coordinator: context.coordinator)
     }
 
+    // MARK: - Marker Placement
+
     private func placeMarkers(in arView: ARView, userLocation: CLLocation, coordinator: Coordinator) {
-        // Remove old markers
+        // Clear previous billboards
         for entry in coordinator.billboardEntries {
             arView.scene.removeAnchor(entry.anchor)
         }
         coordinator.billboardEntries.removeAll()
 
-        // initialHeading is the compass direction (degrees) that -Z pointed at session start
         guard let initialHeadingDeg = coordinator.initialHeading else { return }
         let initialHeadingRad = initialHeadingDeg * .pi / 180
 
-        // --- Pass 1: Compute positions for all markers ---
+        // -- Pass 1: Build marker data from GPS --
 
         struct MarkerData {
             let location: DiningLocation
             let realDistance: Float
-            var arBearing: Float   // may be adjusted for cluster separation
+            var arBearing: Float
             var arDistance: Float
-            var yOffset: Float     // vertical stagger within cluster
+            var yOffset: Float
         }
 
         var markers: [MarkerData] = []
@@ -193,7 +179,6 @@ struct ARViewContainer: UIViewRepresentable {
             let realDistance = Float(userLocation.distance(from: location.clLocation))
             guard realDistance < 5000 else { continue }
 
-            // Recalculate bearing from current GPS position to destination
             let gpsBearing = bearingBetween(
                 userLat: userLocation.coordinate.latitude,
                 userLon: userLocation.coordinate.longitude,
@@ -201,7 +186,11 @@ struct ARViewContainer: UIViewRepresentable {
                 targetLon: location.coordinate.longitude
             )
 
+            // Convert GPS bearing into AR-space bearing by subtracting
+            // the compass heading that was captured at session start.
             let arBearing = gpsBearing - initialHeadingRad
+
+            // Map real distance (0-1000+ m) to a comfortable AR range (5-8 m from origin)
             let arDistance: Float = 5.0 + min(realDistance / 1000.0, 1.0) * 3.0
 
             markers.append(MarkerData(
@@ -213,15 +202,12 @@ struct ARViewContainer: UIViewRepresentable {
             ))
         }
 
-        // Sort by bearing so we can detect angular neighbors
         markers.sort { $0.arBearing < $1.arBearing }
 
-        // --- Pass 2: Detect clusters and spread them apart ---
-        // Two markers overlap if their bearings are within ~15 degrees (~0.26 rad)
-        let clusterThreshold: Float = 0.26
+        // -- Pass 2: Detect angular clusters and spread them apart --
 
-        // Group into clusters of angularly-close markers
-        var clusters: [[Int]] = []  // array of index groups
+        let clusterThreshold: Float = 0.26  // ~15 degrees
+        var clusters: [[Int]] = []
         var visited = Set<Int>()
 
         for i in markers.indices where !visited.contains(i) {
@@ -230,8 +216,6 @@ struct ARViewContainer: UIViewRepresentable {
 
             for j in (i + 1)..<markers.count {
                 if visited.contains(j) { continue }
-
-                // Check angular distance (handle wraparound)
                 let diff = abs(markers[j].arBearing - markers[cluster.last!].arBearing)
                 if diff < clusterThreshold {
                     cluster.append(j)
@@ -244,118 +228,92 @@ struct ARViewContainer: UIViewRepresentable {
             }
         }
 
-        // For each cluster, stagger vertically and nudge bearing slightly
-        let verticalSpacing: Float = 1.0    // 1m between stacked cards
-        let bearingNudge: Float = 0.04       // ~2.3 degrees horizontal nudge
+        let verticalSpacing: Float = 1.0
+        let bearingNudge: Float = 0.04  // ~2.3 degrees
 
         for cluster in clusters {
-            let count = cluster.count
-            let midpoint = Float(count - 1) / 2.0
-
-            // Sort cluster members by real distance (closest at center/bottom)
+            let midpoint = Float(cluster.count - 1) / 2.0
             let sortedByDist = cluster.sorted { markers[$0].realDistance < markers[$1].realDistance }
 
             for (slot, idx) in sortedByDist.enumerated() {
-                // Vertical stagger: centered around y=1.0
-                let verticalOffset = (Float(slot) - midpoint) * verticalSpacing
-                markers[idx].yOffset = verticalOffset
-
-                // Horizontal nudge: spread bearing slightly
-                let horizontalOffset = (Float(slot) - midpoint) * bearingNudge
-                markers[idx].arBearing += horizontalOffset
+                markers[idx].yOffset = (Float(slot) - midpoint) * verticalSpacing
+                markers[idx].arBearing += (Float(slot) - midpoint) * bearingNudge
             }
         }
 
-        // --- Pass 3: Place markers in the scene ---
-        // With orientation-only tracking, camera stays at origin.
-        // Billboards are placed around the origin and naturally stay around the user.
+        // -- Pass 3: Place billboards in the AR scene --
 
         for marker in markers {
             let x = marker.arDistance * sin(marker.arBearing)
             let z = -marker.arDistance * cos(marker.arBearing)
             let y: Float = 1.0 + marker.yOffset
 
+            // Anchor holds the world-space position only (no rotation).
             let anchor = AnchorEntity(world: SIMD3<Float>(x, y, z))
 
-            // Initial face-camera rotation (camera is at origin)
-            let faceUserAngle = atan2(-x, -z)
-            anchor.orientation = simd_quatf(angle: faceUserAngle, axis: SIMD3<Float>(0, 1, 0))
-
-            // Build the billboard card
             buildBillboard(on: anchor, location: marker.location, realDistance: marker.realDistance)
 
             arView.scene.addAnchor(anchor)
 
-            // Store reference for per-frame face-camera updates
             coordinator.billboardEntries.append(BillboardEntry(
                 location: marker.location,
                 anchor: anchor,
-                yOffset: marker.yOffset,
-                bearingNudge: 0
+                yOffset: marker.yOffset
             ))
         }
     }
 
-    /// Builds the billboard card entities and attaches them to the anchor
+    // MARK: - Billboard Construction
+
+    /// Builds a billboard card and attaches it to the given anchor.
+    /// All visual content lives inside a container entity that has
+    /// `BillboardComponent` so it automatically faces the camera.
     private func buildBillboard(on anchor: AnchorEntity, location: DiningLocation, realDistance: Float) {
         let isOpen = location.isOpen()
+
+        // Container entity that will auto-rotate to face the camera
+        let container = Entity()
+        container.components.set(BillboardComponent())
+        anchor.addChild(container)
+
+        // -- Panel colors --
+
         let panelColor: UIColor = isOpen
             ? UIColor(red: 0.1, green: 0.5, blue: 0.1, alpha: 0.88)
             : UIColor(red: 0.6, green: 0.1, blue: 0.1, alpha: 0.88)
 
-        // Name text
-        let nameMesh = MeshResource.generateText(
+        // -- Text entities --
+
+        let nameEntity = makeTextEntity(
             location.name,
-            extrusionDepth: 0.005,
             font: .boldSystemFont(ofSize: 0.22),
-            containerFrame: .zero,
-            alignment: .center,
-            lineBreakMode: .byTruncatingTail
-        )
-        let nameEntity = ModelEntity(
-            mesh: nameMesh,
-            materials: [SimpleMaterial(color: .white, isMetallic: false)]
+            color: .white
         )
 
-        // Distance text
         let distStr: String
         if realDistance < 1000 {
             distStr = String(format: "%.0f m away", realDistance)
         } else {
             distStr = String(format: "%.1f mi away", realDistance / 1609.34)
         }
-        let distMesh = MeshResource.generateText(
+        let distEntity = makeTextEntity(
             distStr,
-            extrusionDepth: 0.005,
             font: .systemFont(ofSize: 0.14),
-            containerFrame: .zero,
-            alignment: .center,
-            lineBreakMode: .byTruncatingTail
-        )
-        let distEntity = ModelEntity(
-            mesh: distMesh,
-            materials: [SimpleMaterial(color: UIColor(white: 0.9, alpha: 1.0), isMetallic: false)]
+            color: UIColor(white: 0.9, alpha: 1.0)
         )
 
-        // Status text
         let statusStr = isOpen ? "Open Now" : "Closed"
-        let statusMesh = MeshResource.generateText(
-            statusStr,
-            extrusionDepth: 0.005,
-            font: .boldSystemFont(ofSize: 0.12),
-            containerFrame: .zero,
-            alignment: .center,
-            lineBreakMode: .byTruncatingTail
-        )
         let statusColor: UIColor = isOpen
             ? UIColor(red: 0.5, green: 1.0, blue: 0.5, alpha: 1.0)
             : UIColor(red: 1.0, green: 0.5, blue: 0.5, alpha: 1.0)
-        let statusEntity = ModelEntity(
-            mesh: statusMesh,
-            materials: [SimpleMaterial(color: statusColor, isMetallic: false)]
+        let statusEntity = makeTextEntity(
+            statusStr,
+            font: .boldSystemFont(ofSize: 0.12),
+            color: statusColor
         )
 
-        // Measure text to size the panel
+        // -- Measure text to size the panel --
+
         let nameBounds = nameEntity.visualBounds(relativeTo: nil)
         let distBounds = distEntity.visualBounds(relativeTo: nil)
         let statusBounds = statusEntity.visualBounds(relativeTo: nil)
@@ -365,15 +323,23 @@ struct ARViewContainer: UIViewRepresentable {
         let panelHeight: Float = 0.7
         let panelDepth: Float = 0.02
 
-        // Background panel
-        let panelMesh = MeshResource.generateBox(size: SIMD3<Float>(panelWidth, panelHeight, panelDepth), cornerRadius: 0.05)
+        // -- Background panel --
+
+        let panelMesh = MeshResource.generateBox(
+            size: SIMD3<Float>(panelWidth, panelHeight, panelDepth),
+            cornerRadius: 0.05
+        )
         let panelEntity = ModelEntity(
             mesh: panelMesh,
             materials: [SimpleMaterial(color: panelColor, isMetallic: false)]
         )
-        anchor.addChild(panelEntity)
+        container.addChild(panelEntity)
 
-        // Position text in front of panel (local +Z faces the user)
+        // -- Position text in front of the panel --
+        // generateText produces text readable from +Z.
+        // BillboardComponent points the entity's +Z toward the camera.
+        // So placing content at +Z puts it on the camera-facing side.
+
         let frontZ: Float = panelDepth / 2 + 0.005
 
         nameEntity.position = SIMD3<Float>(
@@ -381,33 +347,56 @@ struct ARViewContainer: UIViewRepresentable {
             0.12,
             frontZ
         )
-        anchor.addChild(nameEntity)
+        container.addChild(nameEntity)
 
         distEntity.position = SIMD3<Float>(
             -distBounds.extents.x / 2,
             -0.05,
             frontZ
         )
-        anchor.addChild(distEntity)
+        container.addChild(distEntity)
 
         statusEntity.position = SIMD3<Float>(
             -statusBounds.extents.x / 2,
             -0.22,
             frontZ
         )
-        anchor.addChild(statusEntity)
+        container.addChild(statusEntity)
 
-        // Status dot at top-left
+        // -- Status dot (top-left) --
+
         let dot = ModelEntity(
             mesh: .generateSphere(radius: 0.06),
             materials: [SimpleMaterial(color: isOpen ? .systemGreen : .systemRed, isMetallic: false)]
         )
         dot.position = SIMD3<Float>(-panelWidth / 2 + 0.1, 0.22, frontZ)
-        anchor.addChild(dot)
+        container.addChild(dot)
     }
 
-    /// Calculate bearing from point A to point B (returns radians, 0 = north, clockwise)
-    private func bearingBetween(userLat: Double, userLon: Double, targetLat: Double, targetLon: Double) -> Float {
+    /// Helper to create a 3D text entity with the given string, font, and color.
+    private func makeTextEntity(_ text: String, font: UIFont, color: UIColor) -> ModelEntity {
+        let mesh = MeshResource.generateText(
+            text,
+            extrusionDepth: 0.005,
+            font: font,
+            containerFrame: .zero,
+            alignment: .center,
+            lineBreakMode: .byTruncatingTail
+        )
+        return ModelEntity(
+            mesh: mesh,
+            materials: [SimpleMaterial(color: color, isMetallic: false)]
+        )
+    }
+
+    // MARK: - Bearing Calculation
+
+    /// Calculates the bearing (in radians) from one GPS coordinate to another.
+    /// 0 = north, positive = clockwise.
+    private func bearingBetween(
+        userLat: Double, userLon: Double,
+        targetLat: Double, targetLon: Double
+    ) -> Float {
         let lat1 = userLat * .pi / 180
         let lat2 = targetLat * .pi / 180
         let dLon = (targetLon - userLon) * .pi / 180
@@ -418,24 +407,18 @@ struct ARViewContainer: UIViewRepresentable {
         return Float(atan2(y, x))
     }
 
-    // MARK: - Billboard Entry
+    // MARK: - Supporting Types
 
-    /// Stores a reference to a placed billboard anchor and its associated data
     struct BillboardEntry {
         let location: DiningLocation
         let anchor: AnchorEntity
         let yOffset: Float
-        let bearingNudge: Float
     }
-
-    // MARK: - Coordinator
 
     class Coordinator {
         var arView: ARView?
         var lastPlacedLocation: CLLocation?
-        var currentUserLocation: CLLocation?
-        var initialHeading: Float? // Compass heading (degrees) at AR session start
+        var initialHeading: Float?
         var billboardEntries: [BillboardEntry] = []
-        var sceneSubscription: Cancellable?
     }
 }
